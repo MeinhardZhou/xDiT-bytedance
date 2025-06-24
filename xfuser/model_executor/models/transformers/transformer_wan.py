@@ -27,6 +27,7 @@ from xfuser.core.distributed import (
 
 from xfuser.model_executor.models.transformers.register import xFuserTransformerWrappersRegister
 from xfuser.model_executor.models.transformers.base_transformer import xFuserTransformerBaseWrapper
+from xfuser.model_executor.layers.attention_processor import xFuserWanAttnProcessor2_0
 
 logger = init_logger(__name__)
 
@@ -43,7 +44,6 @@ class xFuserWanTransformer3DWrapper(xFuserTransformerBaseWrapper):
         #    submodule_classes_to_wrap=[nn.Conv2d, CogVideoXPatchEmbed],
         #    submodule_name_to_wrap=["attn1"]
         )
-
 
     @xFuserBaseWrapper.forward_check_condition
     def forward(

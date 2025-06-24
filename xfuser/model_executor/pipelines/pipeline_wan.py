@@ -26,6 +26,9 @@ from xfuser.model_executor.pipelines import xFuserPipelineBaseWrapper
 from .register import xFuserPipelineWrapperRegister
 from diffusers.utils import is_torch_xla_available
 
+from xfuser.logger import init_logger
+logger = init_logger(__name__)
+
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
@@ -192,6 +195,15 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
             batch_size = len(prompt)
         else:
             batch_size = prompt_embeds.shape[0]
+
+        get_runtime_state().set_video_input_parameters(
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            batch_size=batch_size,
+            num_inference_steps=num_inference_steps,
+            split_text_embed_in_sp=get_pipeline_parallel_world_size() == 1,
+        )
 
         # 3. Encode input prompt
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
