@@ -110,7 +110,7 @@ def main():
     if is_dp_last_group():
         resolution = f"{input_config.width}x{input_config.height}"
         output_filename = f"results/wan_{parallel_info}_{resolution}.mp4"
-        export_to_video(output, output_filename, fps=16, quality=8)
+        export_to_video(output, output_filename, fps=8)
         print(f"output saved to {output_filename}")
 
     if get_world_group().rank == get_world_group().world_size - 1:
