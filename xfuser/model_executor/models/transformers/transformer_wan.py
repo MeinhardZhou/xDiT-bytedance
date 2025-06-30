@@ -1,6 +1,6 @@
 from typing import Optional, Dict, Any, Union, List, Optional, Tuple, Type
 import torch
-import torch.distributed
+import torch.distributed as dist
 import torch.nn as nn
 
 from diffusers.models.transformers import WanTransformer3DModel
@@ -16,6 +16,7 @@ from xfuser.core.distributed import (
     get_pipeline_parallel_world_size,
     get_classifier_free_guidance_world_size,
     get_classifier_free_guidance_rank,
+    get_sequence_parallel_rank,
     get_pipeline_parallel_rank,
     get_pp_group,
     get_world_group,
@@ -44,6 +45,9 @@ class xFuserWanTransformer3DWrapper(xFuserTransformerBaseWrapper):
         #    submodule_classes_to_wrap=[nn.Conv2d, CogVideoXPatchEmbed],
         #    submodule_name_to_wrap=["attn1"]
         )
+        for block in transformer.blocks:
+            block.attn1.processor = xFuserWanAttnProcessor2_0()
+            block.attn2.processor = xFuserWanAttnProcessor2_0()
 
     @xFuserBaseWrapper.forward_check_condition
     def forward(
@@ -70,6 +74,8 @@ class xFuserWanTransformer3DWrapper(xFuserTransformerBaseWrapper):
                     "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
                 )
 
+        logger.debug(f"origin hidden_states: {hidden_states.shape}, origin encoder_hidden_states: {encoder_hidden_states.shape}")
+
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
@@ -81,6 +87,14 @@ class xFuserWanTransformer3DWrapper(xFuserTransformerBaseWrapper):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        #split timestep hidden_states
+        timestep = torch.chunk(timestep, get_classifier_free_guidance_world_size(),dim=0)[get_classifier_free_guidance_rank()]
+        hidden_states = torch.chunk(hidden_states,
+                                    get_classifier_free_guidance_world_size(),
+                                    dim=0)[get_classifier_free_guidance_rank()]
+        hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=-2)[get_sequence_parallel_rank()]
+
+
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, encoder_hidden_states, encoder_hidden_states_image
         )
@@ -89,7 +103,25 @@ class xFuserWanTransformer3DWrapper(xFuserTransformerBaseWrapper):
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
+        if encoder_hidden_states.shape[-2] % get_sequence_parallel_world_size() != 0:
+            split_text_embed_in_sp = False
+        else:
+            split_text_embed_in_sp = True
+        encoder_hidden_states = torch.chunk(encoder_hidden_states,get_classifier_free_guidance_world_size(),dim=0)[get_classifier_free_guidance_rank()]
+        if split_text_embed_in_sp:
+            encoder_hidden_states = torch.chunk(encoder_hidden_states, get_sequence_parallel_world_size(), dim=-2)[get_sequence_parallel_rank()]
+
+        freqs_cos, freqs_sin = rotary_emb
+        def get_rotary_emb_chunk(freqs):
+            freqs = torch.chunk(freqs, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+            return freqs
+        freqs_cos = get_rotary_emb_chunk(freqs_cos)
+        freqs_sin = get_rotary_emb_chunk(freqs_sin)
+        rotary_emb = (freqs_cos, freqs_sin)
+
         # 4. Transformer blocks
+        logger.debug(f"[rank {dist.get_rank()}] hidden_states: {hidden_states.shape}, encoder_hidden_states: {encoder_hidden_states.shape}")
+
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
                 hidden_states = self._gradient_checkpointing_func(

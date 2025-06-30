@@ -269,7 +269,17 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
                 )
 
                 # pipefusion stage
-                latents = self._async_pipeline()
+                latents = self._async_pipeline(
+                    latents=latents,
+                    timesteps=timesteps[num_pipeline_warmup_steps:],
+                    transformer_dtype=transformer_dtype,
+                    prompt_embeds=prompt_embeds,
+                    num_warmup_steps=num_warmup_steps,
+                    attention_kwargs=attention_kwargs,
+                    progress_bar=progress_bar,
+                    callback_on_step_end=callback_on_step_end,
+                    callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs
+                )
             else:
                 latents = self._sync_pipeline(
                     latents=latents,
@@ -330,7 +340,7 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         sync_only: bool = False,
     ):
-        # latents = self._init_video_sync_pipeline(latents)
+        latents = self._init_video_sync_pipeline(latents)
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
@@ -356,6 +366,7 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
 
             self._current_timestep = t
             latent_model_input = latents.to(transformer_dtype)
+            latent_model_input = torch.cat([latent_model_input] * 2) if self.do_classifier_free_guidance else latents
             timestep = t.expand(latents.shape[0])
 
             noise_pred = self._backbone_forward(
@@ -421,8 +432,163 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
     
     def _async_pipeline(
         self,
+        latents: torch.Tensor,
+        timesteps: List[int],
+        prompt_embeds: torch.Tensor,
+        num_warmup_steps: int,
+        transformer_dtype: str,
+        progress_bar,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        callback_on_step_end: Optional[
+            Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
+        ] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
     ):
-        logger.error(f"async pipeline need to implement")
+        if len(timesteps) == 0:
+            return latents
+
+        num_pipeline_patch = get_runtime_state().num_pipeline_patch
+        num_pipeline_warmup_steps = get_runtime_state().runtime_config.warmup_steps
+
+        logger.debug(f"async latents: {latents.shape}")
+        latent_model_input = latents.to(transformer_dtype)
+        latent_model_input = torch.cat([latent_model_input] * 2) if self.do_classifier_free_guidance else latents
+
+        patch_latents = self._init_async_pipeline(
+            num_timesteps=len(timesteps),
+            latents=latent_model_input,
+            num_pipeline_warmup_steps=num_pipeline_warmup_steps,
+        )
+        last_patch_latents = (
+            [None for _ in range(num_pipeline_patch)]
+            if (is_pipeline_last_stage())
+            else None
+        )
+
+        first_async_recv = True
+        skips = None
+        for i, t in enumerate(timesteps):
+            for patch_idx in range(num_pipeline_patch):
+                if is_pipeline_last_stage():
+                    last_patch_latents[patch_idx] = patch_latents[patch_idx]
+
+                if is_pipeline_first_stage() and i == 0:
+                    pass
+                else:
+                    if first_async_recv:
+                        get_pp_group().recv_next()
+                        if (
+                            get_pipeline_parallel_rank() >= get_pipeline_parallel_world_size() // 2
+                        ):
+                            get_pp_group().recv_skip_next()
+                        first_async_recv = False
+
+                    patch_latents[patch_idx] = get_pp_group().get_pipeline_recv_data(
+                        idx=patch_idx
+                    )
+                    if (
+                        get_pipeline_parallel_rank()
+                        >= get_pipeline_parallel_world_size() // 2
+                    ):
+                        skips = get_pp_group().get_pipeline_recv_skip_data(
+                            idx=patch_idx
+                        )
+
+                timestep = t.expand(patch_latents[patch_idx].shape[0])
+                patch_latents[patch_idx] = self._backbone_forward(
+                    latents=patch_latents[patch_idx],
+                    prompt_embeds=prompt_embeds,
+                    timestep=timestep,
+                    attention_kwargs=attention_kwargs
+                )
+
+                if is_pipeline_last_stage():
+                    patch_latents[patch_idx] = self.scheduler.step(
+                        patch_latents[patch_idx],
+                        t,
+                        last_patch_latents[patch_idx],
+                        return_dict=False,
+                    )[0]
+                    if i != len(timesteps) - 1:
+                        get_pp_group().pipeline_isend(
+                            patch_latents[patch_idx], segment_idx=patch_idx
+                        )
+                elif (
+                    get_pipeline_parallel_rank()
+                    >= get_pipeline_parallel_world_size() // 2
+                ):
+                    get_pp_group().pipeline_isend(
+                        patch_latents[patch_idx], segment_idx=patch_idx
+                    )
+                else:
+                    patch_latents[patch_idx], skips = patch_latents[patch_idx]
+                    get_pp_group().pipeline_isend(
+                        patch_latents[patch_idx], segment_idx=patch_idx
+                    )
+                    get_pp_group().pipeline_isend_skip(skips)
+
+                if is_pipeline_first_stage() and i == 0:
+                    pass
+                else:
+                    if i == len(timesteps) - 1 and patch_idx == num_pipeline_patch - 1:
+                        pass
+                    else:
+                        get_pp_group().recv_next()
+                        if (
+                            get_pipeline_parallel_rank()
+                            >= get_pipeline_parallel_world_size() // 2
+                        ):
+                            get_pp_group().recv_skip_next()
+
+                get_runtime_state().next_patch()
+
+            if i == len(timesteps) - 1 or (
+                (i + num_pipeline_warmup_steps + 1) > num_warmup_steps
+                and (i + num_pipeline_warmup_steps + 1) % self.scheduler.order == 0
+            ):
+                progress_bar.update()
+            if callback_on_step_end is not None:
+                callback_kwargs = {}
+                for k in callback_on_step_end_tensor_inputs:
+                    callback_kwargs[k] = locals()[k]
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                latents = callback_outputs.pop("latents", latents)
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                negative_prompt_embeds = callback_outputs.pop(
+                    "negative_prompt_embeds", negative_prompt_embeds
+                )
+                prompt_embeds_2 = callback_outputs.pop(
+                    "prompt_embeds_2", prompt_embeds_2
+                )
+                negative_prompt_embeds_2 = callback_outputs.pop(
+                    "negative_prompt_embeds_2", negative_prompt_embeds_2
+                )
+
+        latents = None
+        if is_pipeline_last_stage():
+            latents = torch.cat(patch_latents, dim=2)
+            if get_sequence_parallel_world_size() > 1:
+                sp_degree = get_sequence_parallel_world_size()
+                sp_latents_list = get_sp_group().all_gather(
+                    latents, separate_tensors=True
+                )
+                latents_list = []
+                for pp_patch_idx in range(get_runtime_state().num_pipeline_patch):
+                    latents_list += [
+                        sp_latents_list[sp_patch_idx][
+                            ...,
+                            get_runtime_state()
+                            .pp_patches_start_idx_local[
+                                pp_patch_idx
+                            ] : get_runtime_state()
+                            .pp_patches_start_idx_local[pp_patch_idx + 1],
+                            :,
+                        ]
+                        for sp_patch_idx in range(sp_degree)
+                    ]
+                latents = torch.cat(latents_list, dim=-2)
+        return latents
     
     def _backbone_forward(
         self,

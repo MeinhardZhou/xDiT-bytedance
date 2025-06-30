@@ -13,7 +13,7 @@ mkdir -p ./results
 # Wan2.1 specific task args
 TASK_ARGS="--height 768 --width 1360 --num_frames 17 --seed 0 --enable_fa3 --use_torch_compile"
 N_GPUS=8
-PARALLEL_ARGS="--ulysses_degree 2 --ring_degree 2"
+PARALLEL_ARGS="--ulysses_degree 4 --ring_degree 1"
 CFG_ARGS="--use_cfg_parallel"
 
 # Uncomment and modify these as needed

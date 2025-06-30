@@ -10,6 +10,7 @@ from xfuser.core.distributed import (
     initialize_runtime_state,
     is_dp_last_group,
 )
+from xfuser.model_executor.layers.attention_processor import xFuserWanAttnProcessor2_0
 
 from transformers import UMT5EncoderModel
 
@@ -26,8 +27,24 @@ def main():
     engine_config, input_config = engine_args.create_config()
     local_rank = get_world_group().local_rank
 
-    assert engine_args.pipefusion_parallel_degree == 1, "This script does not support PipeFusion."
-    assert engine_args.use_parallel_vae is False, "parallel VAE not implemented for CogVideo"
+    if args.enable_fa3:
+        assert torch.cuda.get_device_capability()[0] >= 9, (
+            "FlashAttention v3 requires SM >= 90. "
+        )
+        import yunchang
+        from yunchang.kernels import AttnType
+        try:
+            import flash_attn_interface
+            FLASH_ATTN_3_AVAILABLE = True
+        except ModuleNotFoundError:
+            FLASH_ATTN_3_AVAILABLE = False
+        assert FLASH_ATTN_3_AVAILABLE == True, ("FlashAttention v3 is not installed")
+
+        setattr(xFuserWanAttnProcessor2_0, "enable_fa3", True)
+    else:
+        setattr(xFuserWanAttnProcessor2_0, "enable_fa3", False)
+
+    assert engine_args.use_parallel_vae is False, "parallel VAE not implemented for Wan2.1"
 
     text_encoder = UMT5EncoderModel.from_pretrained(engine_config.model_config.model, subfolder="text_encoder", torch_dtype=torch.bfloat16)
     vae = AutoencoderKLWan.from_pretrained(engine_config.model_config.model, subfolder="vae", torch_dtype=torch.float32)

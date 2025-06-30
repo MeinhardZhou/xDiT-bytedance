@@ -637,6 +637,8 @@ class DiTRuntimeState(RuntimeState):
             )
 
         self.num_pipeline_patch = self.parallel_config.pp_config.num_pipeline_patch
+        logger.debug(f"num_sp_patches: {num_sp_patches}, sp_patch_idx: {sp_patch_idx}, patch_size: {patch_size}, vae_scale_factor_spatial: {vae_scale_factor_spatial} "
+                     f"latents_height: {latents_height}, latents_width: {latents_width}, num_pipeline_patch: {num_pipeline_patch}")
         # Pipeline patches
         pipeline_patches_height = (
             latents_height + self.num_pipeline_patch - 1

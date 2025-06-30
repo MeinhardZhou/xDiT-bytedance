@@ -11,14 +11,15 @@ INFERENCE_STEP=50
 mkdir -p ./results
 
 # CogVideoX specific task args
-TASK_ARGS="--height 480 --width 720 --num_frames 49 --guidance_scale 6.0"
+TASK_ARGS="--height 512 --width 720 --num_frames 61"
 
 # CogVideoX parallel configuration
-N_GPUS=6
-PARALLEL_ARGS="--ulysses_degree 2 --ring_degree 3"
+N_GPUS=8
+PARALLEL_ARGS="--ulysses_degree 4 --ring_degree 2"
+# PARALLEL_ARGS="--ulysses_degree 2 --ring_degree 2 --pipefusion_parallel_degree 2"
 
 # Uncomment and modify these as needed
-# PIPEFUSION_ARGS="--num_pipeline_patch 8"
+# PIPEFUSION_ARGS="--num_pipeline_patch 4"
 # OUTPUT_ARGS="--output_type latent"
 # PARALLLEL_VAE="--use_parallel_vae"
 # ENABLE_TILING="--enable_tiling"
