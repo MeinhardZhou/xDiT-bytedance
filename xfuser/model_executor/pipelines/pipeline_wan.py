@@ -246,48 +246,49 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        num_pipeline_warmup_steps = get_runtime_state().runtime_config.warmup_steps
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                self._current_timestep = t
-
-                latent_model_input = latents.to(transformer_dtype)
-                latent_model_input = torch.cat([latent_model_input] * 2) if self.do_classifier_free_guidance else latents
-                timestep = t.expand(latent_model_input.shape[0])
-
-                # predict noise model_output
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
+            if (get_pipeline_parallel_world_size() > 1 and len(timesteps) > num_pipeline_warmup_steps):
+                latents = self._sync_pipeline(
+                    latents=latents,
+                    num_warmup_steps=num_warmup_steps,
+                    timesteps=timesteps[:num_pipeline_warmup_steps],
+                    transformer_dtype=transformer_dtype,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    progress_bar=progress_bar,
                     attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
+                    callback_on_step_end=callback_on_step_end,
+                    callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs
+                )
 
-                if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-
-                if XLA_AVAILABLE:
-                    xm.mark_step()
+                latents = self._async_pipeline(
+                    latents=latents,
+                    timesteps=timesteps[num_pipeline_warmup_steps:],
+                    transformer_dtype=transformer_dtype,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    num_warmup_steps=num_warmup_steps,
+                    attention_kwargs=attention_kwargs,
+                    progress_bar=progress_bar,
+                    callback_on_step_end=callback_on_step_end,
+                    callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs
+                )
+            else:
+                latents = self._sync_pipeline(
+                    latents=latents,
+                    num_warmup_steps=num_warmup_steps,
+                    timesteps=timesteps,
+                    transformer_dtype=transformer_dtype,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    progress_bar=progress_bar,
+                    attention_kwargs=attention_kwargs,
+                    callback_on_step_end=callback_on_step_end,
+                    callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+                    sync_only=True
+                )
 
         self._current_timestep = None
 
@@ -314,3 +315,76 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
             return (video,)
 
         return WanPipelineOutput(frames=video)
+
+    def _sync_pipeline(
+            self,
+            latents: torch.Tensor,
+            num_warmup_steps: int,
+            timesteps: List[int],
+            transformer_dtype: str,
+            prompt_embeds: torch.Tensor,
+            negative_prompt_embeds: torch.Tensor,
+            progress_bar,
+            attention_kwargs: Optional[Dict[str, Any]],
+            callback_on_step_end: Optional[Union[Callable[[int, int , Dict], None], PipelineCallback, MultiPipelineCallbacks]],
+            callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+            sync_only: bool = False
+    ):
+        for i, t in enumerate(timesteps):
+            if self.interrupt:
+                continue
+
+            self._current_timestep = t
+
+            latent_model_input = latents.to(transformer_dtype)
+            latent_model_input = torch.cat([latent_model_input] * 2) if self.do_classifier_free_guidance else latents
+            timestep = t.expand(latent_model_input.shape[0])
+
+            # predict noise model_output
+            noise_pred = self.transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
+
+            if self.do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            if callback_on_step_end is not None:
+                callback_kwargs = {}
+                for k in callback_on_step_end_tensor_inputs:
+                    callback_kwargs[k] = locals()[k]
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                latents = callback_outputs.pop("latents", latents)
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+
+            # call the callback, if provided
+            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                progress_bar.update()
+
+            if XLA_AVAILABLE:
+                xm.mark_step()
+        return latents
+        
+
+    def _async_pipeline(
+            self,
+            latents: torch.Tensor,
+            num_warmup_steps: int,
+            timesteps: List[int],
+            prompt_embeds: torch.Tensor,
+            negative_prompt_embeds: torch.Tensor,
+            transformer_dtype: str,
+            progress_bar,
+            attention_kwargs: Optional[Dict[str, Any]],
+            callback_on_step_end: Optional[Union[Callable[[int, int , Dict], None], PipelineCallback, MultiPipelineCallbacks]],
+            callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+    ):
+        logger.error("Need to implement")
