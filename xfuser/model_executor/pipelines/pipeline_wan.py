@@ -14,10 +14,13 @@ from xfuser.config import EngineConfig
 from xfuser.core.distributed import (
     get_cfg_group,
     get_classifier_free_guidance_world_size,
+    is_pipeline_last_stage,
+    is_pipeline_first_stage,
     get_pipeline_parallel_world_size,
     get_runtime_state,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
+    get_pp_group,
     get_sp_group,
     is_dp_last_group,
 )
@@ -330,40 +333,46 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
             callback_on_step_end_tensor_inputs: List[str] = ["latents"],
             sync_only: bool = False
     ):
+        #latents = self._init_video_sync_pipeline(latents)
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
 
-            self._current_timestep = t
-
-            latent_model_input = latents.to(transformer_dtype)
-            latent_model_input = torch.cat([latent_model_input] * 2) if self.do_classifier_free_guidance else latents
-            timestep = t.expand(latent_model_input.shape[0])
-
-            # predict noise model_output
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
+            if is_pipeline_last_stage():
+                last_timestep_latents = latents
+            if get_pipeline_parallel_world_size() == 1:
+                pass
+            elif is_pipeline_first_stage() and i == 0:
+                pass
+            else:
+                latents = get_pp_group().pipeline_recv()
+                if not is_pipeline_first_stage():
+                    encoder_hidden_stats = get_pp_group.pipeline_recv(
+                        0, "encoder_hidden_states"
+                    )
+            latents, encoder_hidden_stats = self._backbone_forward(
+                latents=latents,
+                transformer_dtype=transformer_dtype,
+                encoder_hidden_states=(
+                    prompt_embeds if is_pipeline_first_stage() else encoder_hidden_stats
+                ),
                 attention_kwargs=attention_kwargs,
-                return_dict=False,
-            )[0]
+                t=t,
+            )
 
-            if self.do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-            # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            if is_pipeline_last_stage():
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(latents, t, last_timestep_latents, return_dict=False)[0]
 
-            if callback_on_step_end is not None:
-                callback_kwargs = {}
-                for k in callback_on_step_end_tensor_inputs:
-                    callback_kwargs[k] = locals()[k]
-                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-                latents = callback_outputs.pop("latents", latents)
-                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
 
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -371,6 +380,39 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
 
             if XLA_AVAILABLE:
                 xm.mark_step()
+
+            if sync_only and is_pipeline_last_stage() and i == len(timesteps) - 1:
+                pass
+            elif get_pipeline_parallel_world_size() > 1:
+                get_pp_group().pipeline_send(latents)
+                if not is_pipeline_last_stage():
+                    get_pp_group().pipeline_send(
+                        encoder_hidden_stats, name="encoder_hidden_states"
+                    )
+        
+        # TODO: what's the mean
+        # if (
+        #     sync_only
+        #     and get_sequence_parallel_world_size() > 1
+        #     and is_pipeline_last_stage()
+        # ):
+        #     sp_degree = get_sequence_parallel_world_size()
+        #     sp_latents_list = get_sp_group().all_gather(latents, separate_tensors=True)
+        #     latents_list = []
+        #     for pp_patch_idx in range(get_runtime_state().num_pipeline_patch):
+        #         latents_list += [
+        #             sp_latents_list[sp_patch_idx][
+        #                 :,
+        #                 :,
+        #                 get_runtime_state()
+        #                 .pp_patches_start_idx_local[pp_patch_idx] : get_runtime_state()
+        #                 .pp_patches_start_idx_local[pp_patch_idx + 1],
+        #                 :,
+        #             ]
+        #             for sp_patch_idx in range(sp_degree)
+        #         ]
+        #     latents = torch.cat(latents_list, dim=-2)
+
         return latents
         
 
@@ -388,3 +430,49 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
             callback_on_step_end_tensor_inputs: List[str] = ["latents"],
     ):
         logger.error("Need to implement")
+
+    def _backbone_forward(
+        self,
+        latents: torch.Tensor,
+        transformer_dtype: str,
+        encoder_hidden_states: torch.Tensor,
+        attention_kwargs: Optional[Dict[str, Any]],
+        t: Union[float, torch.Tensor],
+    ):
+        if is_pipeline_first_stage():
+            latent_model_input = latents.to(transformer_dtype)
+            latent_model_input = torch.cat([latent_model_input] * 2) if self.do_classifier_free_guidance else latents
+        else:
+            latent_model_input = latents
+        
+        self._current_timestep = t
+
+        timestep = t.expand(latent_model_input.shape[0])
+
+        # predict noise model_output
+        ret = self.transformer(
+            hidden_states=latent_model_input,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_kwargs=attention_kwargs,
+            return_dict=False,
+        )[0]
+        if self.engine_config.parallel_config.dit_parallel_size > 1:
+            noise_pred, encoder_hidden_states = ret
+        else:
+            noise_pred, encoder_hidden_states = ret, None
+
+        if is_pipeline_last_stage():
+            if get_classifier_free_guidance_world_size() == 1:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            elif get_classifier_free_guidance_world_size() == 2:
+                noise_pred_uncond, noise_pred_text = get_cfg_group().all_gather(
+                    noise_pred, separate_tensors=True
+                )
+            
+            latents = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+        else:
+            latents = noise_pred
+        
+        return latents, encoder_hidden_states
+            
