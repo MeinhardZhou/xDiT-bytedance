@@ -56,7 +56,6 @@ def main():
     else:
         setattr(xFuserWanAttnProcessor2_0, "enable_fa3", False)
     
-    assert engine_args.pipefusion_parallel_degree == 1, "This script does not support PipeFusion."
     assert engine_args.use_parallel_vae is False, "parallel VAE not implemented for Wan2.1"
 
     text_encoder = UMT5EncoderModel.from_pretrained(engine_config.model_config.model, subfolder="text_encoder", torch_dtype=torch.bfloat16)
@@ -112,7 +111,7 @@ def main():
             num_inference_steps=1,
             guidance_scale=5.0,
             generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
-        ).frames[0]
+        )
 
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
@@ -125,7 +124,7 @@ def main():
         num_inference_steps=input_config.num_inference_steps,
         guidance_scale=5.0,
         generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
-    ).frames[0]
+    )
 
     end_time = time.time()
     elapsed_time = end_time - start_time
@@ -138,10 +137,11 @@ def main():
     )
 
     if is_dp_last_group():
-        resolution = f"{input_config.width}x{input_config.height}"
-        output_filename = f"results/wan_{parallel_info}_{resolution}.mp4"
-        export_to_video(output, output_filename, fps=16, quality=8)
-        print(f"output saved to {output_filename}")
+        for i, frame in enumerate(output.frames):
+            resolution = f"{input_config.width}x{input_config.height}"
+            output_filename = f"results/wan_{parallel_info}_{resolution}.mp4"
+            export_to_video(frame, output_filename, fps=16, quality=8)
+            print(f"output saved to {output_filename}")
 
     if get_world_group().rank == get_world_group().world_size - 1:
         print(f"epoch time: {elapsed_time:.2f} sec, parameter memory: {parameter_peak_memory/1e9:.2f} GB, memory: {peak_memory/1e9} GB")

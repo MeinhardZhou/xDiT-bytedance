@@ -953,7 +953,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         receiving_task[0].wait()
         assert (
             receiving_task[1] == name and receiving_task[2] == idx
-        ), "Received tensor does not match the requested"
+        ), f"Received tensor does not match the requested {receiving_task[1]}, {receiving_task[2]}"
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):

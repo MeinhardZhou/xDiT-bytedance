@@ -289,7 +289,7 @@ class DiTRuntimeState(RuntimeState):
             self._calc_consisid_patches_metadata()
         elif self.wan:
             # TODO: implement the wan2.1 video patches metadata
-            pass
+            self._calc_wan_patches_metadata()
         elif self.hunyuan_video:
             # TODO: implement the hunyuan video patches metadata
             pass
@@ -639,6 +639,11 @@ class DiTRuntimeState(RuntimeState):
 
         self.num_pipeline_patch = self.parallel_config.pp_config.num_pipeline_patch
         # Pipeline patches
+
+        logger.debug(f"num_sp_patches: {num_sp_patches}, sp_patch_idx: {sp_patch_idx}, "
+                     f"patch_size: {patch_size}, latents_height: {latents_height}, latent_width: {latents_width}, "
+                     f"num_pipeline_patch {self.num_pipeline_patch}, vae_scale_factor_spatial: {vae_scale_factor_spatial}")
+
         pipeline_patches_height = (
             latents_height + self.num_pipeline_patch - 1
         ) // self.num_pipeline_patch
