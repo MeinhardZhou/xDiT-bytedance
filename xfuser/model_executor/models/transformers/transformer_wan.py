@@ -76,15 +76,20 @@ class xFuserWanTransformer3DWrapper(xFuserTransformerBaseWrapper):
                     "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
                 )
 
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        batch_size = hidden_states.shape[0]
+        num_frames = self._get_patch_num_latent_frames()
+        height, width = self._get_video_patch_height_width()
+
+        logger.debug(f"transformer meta: hidden_states: {hidden_states.shape}, batch_size: {batch_size}, num_frames: {num_frames}, height: {height}, width: {width}")
+
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        rotary_emb = self.rope(hidden_states)
-
+        rotary_emb = None
         if is_pipeline_first_stage():
+            rotary_emb = self.rope(hidden_states)
             hidden_states = self.patch_embedding(hidden_states)
             hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
@@ -95,6 +100,13 @@ class xFuserWanTransformer3DWrapper(xFuserTransformerBaseWrapper):
                                         dim=0)[get_classifier_free_guidance_rank()]
             hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=-2)[get_sequence_parallel_rank()]
 
+            freqs_cos, freqs_sin = rotary_emb
+            def get_rotary_emb_chunk(freqs):
+                freqs = torch.chunk(freqs, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+                return freqs
+            freqs_cos = get_rotary_emb_chunk(freqs_cos)
+            freqs_sin = get_rotary_emb_chunk(freqs_sin)
+            rotary_emb = (freqs_cos, freqs_sin)
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, encoder_hidden_states, encoder_hidden_states_image
@@ -112,14 +124,6 @@ class xFuserWanTransformer3DWrapper(xFuserTransformerBaseWrapper):
         if split_text_embed_in_sp:
             encoder_hidden_states = torch.chunk(encoder_hidden_states, get_sequence_parallel_world_size(), dim=-2)[get_sequence_parallel_rank()]
 
-        freqs_cos, freqs_sin = rotary_emb
-        def get_rotary_emb_chunk(freqs):
-            freqs = torch.chunk(freqs, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
-            return freqs
-        freqs_cos = get_rotary_emb_chunk(freqs_cos)
-        freqs_sin = get_rotary_emb_chunk(freqs_sin)
-        rotary_emb = (freqs_cos, freqs_sin)
-
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
@@ -129,7 +133,6 @@ class xFuserWanTransformer3DWrapper(xFuserTransformerBaseWrapper):
         else:
             for block in self.blocks:
                 hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
-
 
         if is_pipeline_last_stage():
             # 5. Output norm, projection & unpatchify

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pickle
 
 import torch
-import torch.distributed
+import torch.distributed as dist
 from torch.distributed import Backend, ProcessGroup
 
 import xfuser.envs as envs
@@ -908,6 +908,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
     def pipeline_send(
         self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1
     ) -> None:
+        logger.debug(f"[rank {dist.get_rank()}] pipeline send name: {name}, segment_idx: {segment_idx}, tensor: {tensor.shape}")
         tensor = tensor.contiguous()
         self._check_shape_and_buffer(
             tensor_send_to_next=tensor, name=name, segment_idx=segment_idx
@@ -917,6 +918,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
     def pipeline_isend(
         self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1
     ) -> None:
+        logger.debug(f"[rank {dist.get_rank()}] pipeline isend name: {name}, segment_idx: {segment_idx}, tensor: {tensor.shape}")
         tensor = tensor.contiguous()
         self._check_shape_and_buffer(
             tensor_send_to_next=tensor, name=name, segment_idx=segment_idx
@@ -927,6 +929,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
         name = name or "latent"
         self._check_shape_and_buffer(recv_prev=True, name=name, segment_idx=idx)
         self._pipeline_irecv(self.recv_buffer[name][idx]).wait()
+
+        logger.debug(f"[rank {dist.get_rank()}] pipeline recv name: {name}, segment_idx: {idx}, tensor: {self.recv_buffer[name][idx].shape}")
         return self.recv_buffer[name][idx]
 
     def add_pipeline_recv_task(self, idx: int = -1, name: str = "latent"):
@@ -939,6 +943,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         elif len(self.recv_tasks_queue) > 0:
             name, idx = self.recv_tasks_queue.pop(0)
             self._check_shape_and_buffer(recv_prev=True, name=name, segment_idx=idx)
+            logger.debug(f"[rank {dist.get_rank()}] pipeline recv next name: {name}, segment_idx: {idx}, tensor: {self.recv_buffer[name][idx].shape}")
             self.receiving_tasks.append(
                 (self._pipeline_irecv(self.recv_buffer[name][idx]), name, idx)
             )
@@ -951,9 +956,11 @@ class PipelineGroupCoordinator(GroupCoordinator):
         ), "No tasks to receive, call add_pipeline_recv_task first"
         receiving_task = self.receiving_tasks.pop(0)
         receiving_task[0].wait()
+
+        logger.debug(f"[rank {dist.get_rank()}] pipeline recv data name: {receiving_task[1]}, segment_idx: {receiving_task[2]}, tensor: {self.recv_buffer[name][idx].shape}")
         assert (
             receiving_task[1] == name and receiving_task[2] == idx
-        ), f"Received tensor does not match the requested {receiving_task[1]}, {receiving_task[2]}"
+        ), f"Received tensor does not match the requested name:{name} but {receiving_task[1]}, {receiving_task[2]}"
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):

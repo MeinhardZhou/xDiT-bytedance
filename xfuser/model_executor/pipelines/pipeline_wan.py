@@ -4,7 +4,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-import torch.distributed
+import torch.distributed as dist
 from diffusers import WanPipeline
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.pipelines.wan.pipeline_wan import WanPipelineOutput
@@ -322,6 +322,20 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
         else:
             return None
 
+    def _init_sync_pipeline(
+            self,
+            latents: torch.Tensor,
+            prompt_embeds: torch.Tensor,
+    ):
+        latents = super()._init_video_sync_pipeline(latents)
+        if get_runtime_state().split_text_embed_in_sp:
+            if prompt_embeds.shape[-2] % get_sequence_parallel_world_size() == 0:
+                prompt_embeds = torch.chunk(prompt_embeds, get_sequence_parallel_world_size(), dim=-2)[get_sequence_parallel_rank()]
+            else:
+                get_runtime_state().split_text_embed_in_sp = False
+
+        return latents, prompt_embeds
+
     def _sync_pipeline(
             self,
             latents: torch.Tensor,
@@ -336,7 +350,7 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
             callback_on_step_end_tensor_inputs: List[str] = ["latents"],
             sync_only: bool = False
     ):
-        #latents = self._init_video_sync_pipeline(latents)
+        latents, prompt_embeds = self._init_sync_pipeline(latents, prompt_embeds)
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
@@ -350,7 +364,7 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
             else:
                 latents = get_pp_group().pipeline_recv()
                 if not is_pipeline_first_stage():
-                    encoder_hidden_stats = get_pp_group.pipeline_recv(
+                    encoder_hidden_stats = get_pp_group().pipeline_recv(
                         0, "encoder_hidden_states"
                     )
             latents, encoder_hidden_stats = self._backbone_forward(
@@ -417,7 +431,51 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
         #     latents = torch.cat(latents_list, dim=-2)
 
         return latents
+
+    def _init_async_pipeline(
+        self,
+        num_timesteps: int,
+        latents: torch.Tensor,
+        num_pipeline_warmup_steps: int,
+    ):
+        get_runtime_state().set_patched_mode(patch_mode=True)
+
+        if is_pipeline_first_stage():
+            # get latents computed in warmup stage
+            # ignore latents after the last timestep
+            latents = (
+                get_pp_group().pipeline_recv()
+                if num_pipeline_warmup_steps > 0
+                else latents
+            )
+            patch_latents = list(
+                latents.split(get_runtime_state().pp_patches_height, dim=3)
+            )
+        elif is_pipeline_last_stage():
+            patch_latents = list(
+                latents.split(get_runtime_state().pp_patches_height, dim=3)
+            )
+        else:
+            patch_latents = [
+                None for _ in range(get_runtime_state().num_pipeline_patch)
+            ]
         
+        recv_timesteps = (
+            num_timesteps - 1 if is_pipeline_first_stage() else num_timesteps
+        )
+
+        if is_pipeline_first_stage():
+            for _ in range(recv_timesteps):
+                for patch_idx in range(get_runtime_state().num_pipeline_patch):
+                    get_pp_group().add_pipeline_recv_task(patch_idx)
+        else:
+            for _ in range(recv_timesteps):
+                get_pp_group().add_pipeline_recv_task(0, "encoder_hidden_states")
+                for patch_idx in range(get_runtime_state().num_pipeline_patch):
+                    get_pp_group().add_pipeline_recv_task(patch_idx)
+
+        return patch_latents
+
 
     def _async_pipeline(
             self,
@@ -503,7 +561,7 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
                         negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
 
                     # call the callback, if provided
-                    if i == len(timesteps) - 1:
+                    if i != len(timesteps) - 1:
                         get_pp_group().pipeline_isend(
                             patch_latents[patch_idx], segment_idx=patch_idx
                         )
@@ -575,6 +633,8 @@ class xFuserWanPipeline(xFuserPipelineBaseWrapper):
         attention_kwargs: Optional[Dict[str, Any]],
         t: Union[float, torch.Tensor],
     ):
+        logger.debug(f"[rank {dist.get_rank()}] backbone forward latents: {latents.shape}, is_pipeline_first_stage: {is_pipeline_first_stage()}")
+
         if is_pipeline_first_stage():
             latent_model_input = latents.to(transformer_dtype)
             latent_model_input = torch.cat([latent_model_input] * 2) if self.do_classifier_free_guidance else latents

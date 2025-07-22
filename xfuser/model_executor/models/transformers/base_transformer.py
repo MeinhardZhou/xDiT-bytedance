@@ -163,9 +163,33 @@ class xFuserTransformerBaseWrapper(xFuserModelBaseWrapper, metaclass=ABCMeta):
     def forward(self, *args, **kwargs):
         pass
 
+    def _get_video_patch_height_width(self) -> Tuple[int, int]:
+        patch_size = get_runtime_state().backbone_patch_size
+        if len(patch_size) == 3:
+            height_patch_size, width_patch_size = patch_size[1], patch_size[2]
+        else:
+            height_patch_size, width_patch_size = patch_size, patch_size
+
+        vae_scale_factor_spatial = get_runtime_state().vae_scale_factor_spatial
+        width = get_runtime_state().input_config.width // vae_scale_factor_spatial
+
+        logger.debug(f"patch_mode: {get_runtime_state().patch_mode}, pp_patches_height: {get_runtime_state().pp_patches_height}")
+
+        if get_runtime_state().patch_mode:
+            height = (
+                get_runtime_state().pp_patches_height[
+                    get_runtime_state().pipeline_patch_idx
+                ]
+            )
+        else:
+            height = sum(get_runtime_state().pp_patches_height)
+
+        return height, width
+
     def _get_patch_height_width(self) -> Tuple[int, int]:
         patch_size = get_runtime_state().backbone_patch_size
         vae_scale_factor = get_runtime_state().vae_scale_factor
+
         width = get_runtime_state().input_config.width // patch_size // vae_scale_factor
 
         if get_runtime_state().patch_mode:
@@ -178,3 +202,17 @@ class xFuserTransformerBaseWrapper(xFuserModelBaseWrapper, metaclass=ABCMeta):
         else:
             height = sum(get_runtime_state().pp_patches_height) // patch_size
         return height, width
+
+    def _get_patch_num_latent_frames(self) -> int:
+        num_frames = get_runtime_state().input_config.num_frames
+        vae_scale_factor_temporal = get_runtime_state().vae_scale_factor_temporal
+
+        if num_frames % vae_scale_factor_temporal != 1:
+            logger.warning(
+                f"`num_frames - 1` has to be divisible by {vae_scale_factor_temporal}. Rounding to the nearest number."
+            )
+            num_frames = num_frames // vae_scale_factor_temporal * vae_scale_factor_temporal + 1
+        num_frames = max(num_frames, 1)
+
+        num_latent_frames = (num_frames - 1) // vae_scale_factor_temporal + 1
+        return num_latent_frames

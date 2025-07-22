@@ -12,11 +12,11 @@ mkdir -p ./results
 
 # Wan2.1 specific task args
 N_GPUS=8
-# TASK_ARGS="--height 768 --width 1280 --num_frames 17 --seed 0 --enable_fa3 --use_torch_compile"
-# PARALLEL_ARGS="--ulysses_degree 4 --ring_degree 2"
+TASK_ARGS="--height 768 --width 1280 --num_frames 17 --seed 0 --enable_fa3 --use_torch_compile"
+PARALLEL_ARGS="--ulysses_degree 4 --ring_degree 2"
 
-TASK_ARGS="--height 768 --width 1280 --num_frames 93 --seed 0 --enable_fa3 --use_torch_compile"
-PARALLEL_ARGS="--ulysses_degree 2 --ring_degree 2 --pipefusion_parallel_degree 2"
+# TASK_ARGS="--height 768 --width 1280 --num_frames 93 --seed 0 --enable_fa3 --use_torch_compile"
+# PARALLEL_ARGS="--ulysses_degree 2 --ring_degree 2 --pipefusion_parallel_degree 2"
 
 
 # CFG_ARGS="--use_cfg_parallel"
